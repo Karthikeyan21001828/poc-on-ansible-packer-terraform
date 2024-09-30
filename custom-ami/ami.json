@@ -1,0 +1,24 @@
+{
+  "variables": {
+    "aws_region": "us-east-1",
+    "source_ami": "ami-0c02fb55956c7d316", 
+    "instance_type": "t2.medium"
+  },
+  "builders": [{
+    "type": "amazon-ebs",
+    "region": "{{user `aws_region`}}",
+    "source_ami": "{{user `source_ami`}}",
+    "instance_type": "{{user `instance_type`}}",
+    "ssh_username": "ec2-user",
+    "ami_name": "custom-amazon-linux-ami-with-docker-git-{{timestamp}}",
+    "user_data": "#!/bin/bash\nsudo yum install -y openssh-server"
+  }],
+  "provisioners": [
+    {
+      "type": "ansible",
+      "playbook_file": "../custom-ami/playbook.yml",
+      "extra_arguments": ["--skip-tags", "copy"]
+    }
+  ]
+}
+

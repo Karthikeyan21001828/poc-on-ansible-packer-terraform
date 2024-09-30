@@ -1,0 +1,290 @@
+---
+- name: Configure Jenkins and SonarQube on Docker Containers
+  hosts: all
+  become: true
+  vars:
+    ansible_host: "{{ inventory_hostname }}"
+    jenkins_host: "{{ inventory_hostname }}"
+    jenkins_user: "admin"
+    jenkins_password: "admin"
+    jenkins_casc_path: "/var/jenkins_home/casc_configs/jenkins.yaml"  # Path to JCasC in Jenkins container
+    sonar_scanner_home: "/opt/sonar-scanner"
+    sonar_scanner_version: "4.7.0.2747"  # Change to a specific version
+    sonar_scanner_url: "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-{{ sonar_scanner_version }}-linux.zip"
+    sonar_scanner_dir: "/opt/sonar-scanner"
+    jenkins_container_name: "jenkins"
+    sonarqube_port: 9000
+    sonarqube_admin_login: "admin"
+    sonarqube_admin_password: "admin123"
+    sonarqube_project_key: "my_project"
+    sonarqube_project_name: "My Project"
+    sonarqube_token_name: "my_token_{{ ansible_date_time.epoch }}"
+    quality_gate_name: "Sonar way"
+  tasks:
+    - name: Ensure passwordless sudo for the user
+      lineinfile:
+        path: /etc/sudoers
+        line: "{{ ansible_user }} ALL=(ALL) NOPASSWD: ALL"
+        state: present
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Ensure Jenkins home directory structure exists
+      shell: |
+        docker exec jenkins bash -c "mkdir -p /var/jenkins_home/users/admin"
+
+    - name: Ensure init.groovy.d directory exists
+      command: docker exec jenkins mkdir -p /var/jenkins_home/init.groovy.d
+
+    - name: Disable Jenkins setup wizard inside container
+      shell: |
+        docker exec jenkins bash -c 'echo "JAVA_OPTS=-Djenkins.install.runSetupWizard=false" > /var/jenkins_home/init.groovy.d/configuration'
+
+    - name: Create Jenkins admin user configuration
+      shell: |
+        docker exec -i jenkins tee /var/jenkins_home/init.groovy.d/basic-security.groovy <<EOF
+        #!groovy
+        import jenkins.model.*
+        import hudson.security.*
+        def instance = Jenkins.getInstance()
+        println "--> creating local user 'admin'"
+        def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+        hudsonRealm.createAccount('admin', 'admin')
+        instance.setSecurityRealm(hudsonRealm)
+        def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+        instance.setAuthorizationStrategy(strategy)
+        instance.setCrumbIssuer(null)
+        instance.save()
+        EOF
+
+    - name: Restart Jenkins service to apply changes
+      shell: docker restart jenkins
+
+    - name: Wait for Jenkins to restart
+      wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 8080
+        delay: 15
+        timeout: 300
+
+    - name: Download Jenkins CLI
+      uri:
+        url: http://{{jenkins_host}}:8080/jnlpJars/jenkins-cli.jar
+        dest: /tmp/jenkins-cli.jar
+        return_content: yes
+        method: GET
+      register: jenkins_cli_download
+      retries: 5
+      delay: 10 
+      until: jenkins_cli_download.status == 200  
+
+    - name: Copy jenkins-cli.jar to Jenkins container
+      command: docker cp /tmp/jenkins-cli.jar jenkins:/tmp/jenkins-cli.jar
+
+    - name: Install Jenkins plugins
+      command: >
+        docker exec jenkins java -jar /tmp/jenkins-cli.jar -s http://{{ jenkins_host }}:8080/ -auth {{ jenkins_user }}:{{ jenkins_password }} install-plugin {{ item }}
+      loop:
+        - git
+        - workflow-aggregator
+        - sonar
+        - pipeline-utility-steps 
+      register: install_result
+
+    - name: Verify Jenkins is running
+      shell: |
+        curl -f -u admin:admin 'http://{{ jenkins_host }}:8080/api/json'
+      register: jenkins_status
+      retries: 5
+      delay: 10
+      until: jenkins_status.rc == 0
+
+    - name: Install required packages
+      yum:
+        name: unzip
+        state: present
+
+    - name: Download SonarQube Scanner
+      get_url:
+        url: "{{ sonar_scanner_url }}"
+        dest: "/tmp/sonar-scanner-cli-{{ sonar_scanner_version }}.zip"
+
+    - name: Unzip SonarQube Scanner
+      unarchive:
+        src: "/tmp/sonar-scanner-cli-{{ sonar_scanner_version }}.zip"
+        dest: "/tmp/"
+        remote_src: yes
+
+    - name: Set use_embed_jre
+      lineinfile:
+        path: "/tmp/sonar-scanner-{{ sonar_scanner_version }}-linux/bin/sonar-scanner"
+        regexp: 'use_embedded_jre=true'
+        line: 'use_embedded_jre=false'
+
+    - name: Copy SonarQube Scanner to Jenkins container
+      shell: |
+        sudo docker cp /tmp/sonar-scanner-{{ sonar_scanner_version }}-linux {{ jenkins_container_name }}:{{ sonar_scanner_dir }}
+
+    - name: Ensure Jenkins user exists
+      ansible.builtin.user:
+        name: jenkins
+        state: present
+
+    - name: Ensure Jenkins home directory exists
+      ansible.builtin.file:
+        path: /var/jenkins_home
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0755'
+
+    - name: Ensure .bashrc exists for Jenkins user in Docker
+      shell: |
+        docker exec -u root jenkins bash -c 'touch /var/jenkins_home/.bashrc && chown jenkins:jenkins /var/jenkins_home/.bashrc'
+
+    - name: Add content to .bashrc for Jenkins user
+      shell: |
+        docker exec -u jenkins jenkins bash -c 'echo "export PATH=$PATH:/usr/local/bin" >> /var/jenkins_home/.bashrc'
+
+    - name: Source the updated .bashrc for Jenkins user
+      shell: |
+        docker exec -u jenkins jenkins bash -c 'source /var/jenkins_home/.bashrc'
+
+    - name: Clean up downloaded zip file from the host
+      file:
+        path: "/tmp/sonar-scanner-cli-{{ sonar_scanner_version }}.zip"
+        state: absent
+
+    - name: Wait until SonarQube Container is reachable via TCP/IP.
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ sonarqube_port }}"
+        state: started
+        delay: 5
+        connect_timeout: 15
+        timeout: 30
+
+    - name: Check SonarQube to be healthy.
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ sonarqube_port }}/api/system/health"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_admin_password }}"
+        method: GET
+        force_basic_auth: yes
+      register: response
+      until: response.status == 200 and response.json.health == 'GREEN'
+      retries: 20
+      delay: 5
+
+    - name: Create a new project in SonarQube
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ sonarqube_port }}/api/projects/create?project={{ sonarqube_project_key }}&name={{ sonarqube_project_name | urlencode }}"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_admin_password }}"
+        method: POST
+        force_basic_auth: yes
+      register: project_response
+
+    - name: Generate user token
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ sonarqube_port }}/api/user_tokens/generate"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_admin_password }}"
+        method: POST
+        force_basic_auth: yes
+        body: "name={{ sonarqube_token_name }}"
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+      register: token_response
+    
+    - name: Debug token response
+      debug:
+        msg: "{{ token_response.json.token }}"
+
+    - name: Save token to a temporary file on remote
+      ansible.builtin.copy:
+        content: "{{ token_response.json.token }}"
+        dest: "/tmp/sonarqube_token.txt"
+
+    - name: Fetch token file to local machine
+      ansible.builtin.fetch:
+        src: "/tmp/sonarqube_token.txt"
+        dest: "./sonarqube_token.txt" 
+        flat: yes
+
+    - name: Clean up temporary token file on remote
+      ansible.builtin.file:
+        path: "/tmp/sonarqube_token.txt"
+        state: absent
+
+    - name: Set the default quality gate
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ sonarqube_port }}/api/qualitygates/set_as_default"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_admin_password }}"
+        method: POST
+        force_basic_auth: yes
+        body: "name={{ quality_gate_name | urlencode }}"  # URL-encoded name of the quality gate
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+      register: quality_gate_response
+      failed_when: quality_gate_response.status not in [200, 204]  # Allow 204 as a valid response
+
+    - name: Create webhook
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ sonarqube_port }}/api/webhooks/create"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_admin_password }}"
+        method: POST
+        force_basic_auth: yes
+        body: "name=My Webhook&project={{ sonarqube_project_key }}&url=http://54.82.5.3:8080/sonarqube-webhook/"
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+      register: webhook_response
+
+    - name: Output project creation result
+      debug:
+        var: project_response
+
+    - name: Output token generation result
+      debug:
+        var: token_response
+
+    - name: Output quality gate configuration result
+      debug:
+        var: quality_gate_response
+
+    - name: Output webhook creation result
+      debug:
+        var: webhook_response
+
+    - name: Install Job DSL Plugin on Jenkins
+      shell: |
+        docker exec -i jenkins java -jar /tmp/jenkins-cli.jar -s http://{{ jenkins_host }}:8080/ -auth {{ jenkins_user }}:{{ jenkins_password }} install-plugin job-dsl
+      ignore_errors: true
+
+    - name: Create Jenkins job configuration XML from template
+      template:
+        src: templates/job-config.xml.j2
+        dest: /tmp/job-config.xml
+
+    - name: Upload job configuration XML to Jenkins container
+      command: docker cp /tmp/job-config.xml jenkins:/tmp/job-config.xml
+
+    - name: Install Jenkins Pipeline plugin
+      command: docker exec jenkins bash -c "java -jar /tmp/jenkins-cli.jar -s http://{{ jenkins_host }}:8080/ -auth admin:admin install-plugin workflow-aggregator -deploy"
+
+    - name: Restart Jenkins container
+      command: docker restart jenkins
+
+    - name: Verify Jenkins is running
+      shell: |
+        curl -f -u admin:admin 'http://{{ jenkins_host }}:8080/api/json'
+      register: jenkins_status
+      retries: 5
+      delay: 10
+      until: jenkins_status.rc == 0
+
+    - name: Create Jenkins pipeline job from XML config
+      shell: |
+        docker exec -i jenkins java -jar /tmp/jenkins-cli.jar -s http://{{ jenkins_host }}:8080/ -auth {{ jenkins_user }}:{{ jenkins_password }} create-job Dribble-Clone < /tmp/job-config.xml
+    

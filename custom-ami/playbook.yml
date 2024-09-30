@@ -1,0 +1,48 @@
+---
+- hosts: all
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Update yum package manager
+      yum:
+        name: '*'
+        state: latest
+      register: yum_update
+      retries: 5
+      delay: 10
+      until: yum_update is succeeded
+   
+    - name: Wait for yum lock to be released
+      shell: |
+        while sudo lsof /var/lib/rpm/.rpm.lock; do
+          echo "Waiting for yum lock to be released..."
+          sleep 10
+        done
+      ignore_errors: true
+
+    - name: Pause for a few seconds
+      pause:
+        seconds: 15
+
+
+    - name: Install openssh-server (SFTP server)
+      yum:
+        name: openssh-server
+        state: present
+
+    - name: Install Docker
+      yum:
+        name: docker
+        state: present
+
+    - name: Install Git
+      yum:
+        name: git
+        state: present
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
